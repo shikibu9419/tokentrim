@@ -1,5 +1,6 @@
 import tiktoken
 from typing import List, Dict, Any, Tuple, Optional, Union
+from copy import deepcopy
 
 MODEL_MAX_TOKENS = {
   'gpt-4': 8192,
@@ -13,50 +14,47 @@ MODEL_MAX_TOKENS = {
   'code-llama': 1048, # I'm not sure this is correct.
 }
 
+NUM_TOKENS_OFFSET = 3
+
+def get_encoding(model: Optional[str]):
+  # Attempt to get the encoding for the specified model
+  try:
+    return tiktoken.encoding_for_model(model or "cli100k_base")
+  except KeyError:
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def get_tokens_per_name_and_message(model: Optional[str]) -> Tuple[int, int]:
+  if model in [
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-16k-0613",
+    "gpt-4-0314",
+    "gpt-4-32k-0314",
+    "gpt-4-0613",
+    "gpt-4-32k-0613",
+  ]:
+    return (1, 3)
+  elif model == "gpt-3.5-turbo-0301":
+    return (-1, 4)
+  else:
+    # Slightly raised numbers for an unknown model / prompt template
+    # In the future this should be customizable
+    return (2, 4)
+
+
 def num_tokens_from_messages(messages: List[Dict[str, Any]],
                              model) -> int:
   """
   Function to return the number of tokens used by a list of messages.
   """
 
-  # Attempt to get the encoding for the specified model
-  if model == None:
-    encoding = tiktoken.get_encoding("cl100k_base")
-  else:
-    try:
-      encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-      encoding = tiktoken.get_encoding("cl100k_base")
+  if model == "gpt-3.5-turbo":
+    model = "gpt-3.5-turbo-0613"
+  if model == "gpt-4":
+    model = "gpt-4-0613"
 
-  # Token handling specifics for different model types
-  if model == None:
-    # Slightly raised numbers for an unknown model / prompt template
-    # In the future this should be customizable
-    tokens_per_message = 4
-    tokens_per_name = 2
-  else:
-    if model in {
-        "gpt-3.5-turbo-0613",
-        "gpt-3.5-turbo-16k-0613",
-        "gpt-4-0314",
-        "gpt-4-32k-0314",
-        "gpt-4-0613",
-        "gpt-4-32k-0613",
-    }:
-      tokens_per_message = 3
-      tokens_per_name = 1
-    elif model == "gpt-3.5-turbo-0301":
-      tokens_per_message = 4
-      tokens_per_name = -1
-    elif "gpt-3.5-turbo" in model:
-      return num_tokens_from_messages(messages, model="gpt-3.5-turbo-0613")
-    elif "gpt-4" in model:
-      return num_tokens_from_messages(messages, model="gpt-4-0613")
-    else:
-      # Slightly raised numbers for an unknown model / prompt template
-      # In the future this should be customizable
-      tokens_per_message = 4
-      tokens_per_name = 2
+  encoding = get_encoding(model)
+  (tokens_per_name, tokens_per_message) = get_tokens_per_name_and_message(model)
 
   # Calculate the number of tokens
   num_tokens = 0
@@ -71,36 +69,43 @@ def num_tokens_from_messages(messages: List[Dict[str, Any]],
         print(f"Failed to parse '{key}'.")
         pass
 
-  num_tokens += 3
+  num_tokens += NUM_TOKENS_OFFSET
+
   return num_tokens
 
 
-def shorten_message_to_fit_limit(message: Dict[str, Any], tokens_needed: int,
-                                 model) -> None:
+def get_trimmed_message(_message: Dict[str, Any], tokens_needed: int,
+                                 model) -> Dict[str, Any]:
   """
   Shorten a message to fit within a token limit by removing characters from the middle.
   """
+  # Make a deep copy of the message to avoid modifying the original
+  message = deepcopy(_message)
 
-  content = message["content"]
+  # If the limit is exceeded only by the token offset of the message, return without trimming
+  (_, tokens_per_message) = get_tokens_per_name_and_message(model)
+  if tokens_per_message + NUM_TOKENS_OFFSET > tokens_needed:
+    return message
+
+  encoding = get_encoding(model)
 
   while True:
-    total_tokens = num_tokens_from_messages([message], model)
+    content = message["content"]
 
+    total_tokens = num_tokens_from_messages([message], model)
     if total_tokens <= tokens_needed:
       break
 
-    ratio = (tokens_needed) / total_tokens
-
-    new_length = int(len(content) * ratio)
+    tokens = encoding.encode(content)
+    new_length = len(tokens) * (tokens_needed) // total_tokens
 
     half_length = new_length // 2
-    left_half = content[:half_length]
-    right_half = content[-half_length:]
+    (left_half, right_half) = (tokens[:half_length], tokens[-half_length:])
+    trimmed_content = encoding.decode(left_half) + '...' + encoding.decode(right_half)
 
-    trimmed_content = left_half + '...' + right_half
     message["content"] = trimmed_content
-    content = trimmed_content
 
+  return message
 
 def trim(
   messages: List[Dict[str, Any]],
@@ -131,7 +136,7 @@ def trim(
     # Check if model is valid
     if model not in MODEL_MAX_TOKENS:
       raise ValueError(f"Invalid model: {model}. Specify max_tokens instead")
-      
+
     max_tokens = int(MODEL_MAX_TOKENS[model] * trim_ratio)
 
   # Deduct the system message tokens from the max_tokens if system message exists
@@ -143,54 +148,44 @@ def trim(
 
     if system_message_tokens > max_tokens:
       print("`tokentrim`: Warning, system message exceeds token limit, which is probably undesired. Trimming...")
-      
-      shorten_message_to_fit_limit(system_message_event, max_tokens, model)
+
+      system_message_event = get_trimmed_message(system_message_event, max_tokens, model)
       system_message_tokens = num_tokens_from_messages([system_message_event],
                                                      model)
-    
-    max_tokens -= system_message_tokens
 
     max_tokens -= system_message_tokens
+
+  if max_tokens < 0:
+    raise ValueError("TOKEN TRIMMING FAILED: Token limit is exceeded for only trimmed system message and function call messages.")
 
   final_messages = []
+  tokens_remaining = max_tokens
 
-  # Reverse the messages so we process oldest messages first
-  messages = messages[::-1]
+  # Process the messages from latest
+  for message in messages[::-1]:
+    raw_message_tokens = num_tokens_from_messages([message], model)
 
-  # Process the messages
-  for message in messages:
-    temp_messages = [message] + final_messages
-    temp_messages_tokens = num_tokens_from_messages(temp_messages, model)
-
-    if temp_messages_tokens <= max_tokens:
-      # If adding the next message doesn't exceed the token limit, add it to final_messages
-      final_messages = [message] + final_messages
-    else:
-      final_messages_tokens = num_tokens_from_messages(final_messages, model)
-      tokens_remaining = max_tokens - final_messages_tokens
-
-      # If we have some tokens to play with, we can try trimming the top message.
-      if True:
-
+    if raw_message_tokens > tokens_remaining:
+      if "function_call" not in message:
         # If adding the next message exceeds the token limit, try trimming it
         # (This only works for non-function call messages)
-        if "function_call" not in message:
-          shorten_message_to_fit_limit(message, tokens_remaining, model)
+        message = get_trimmed_message(message, tokens_remaining, model)
 
-        # If the trimmed message can fit, add it
-        if num_tokens_from_messages(
-          [message], model) + final_messages_tokens <= max_tokens:
-          final_messages = [message] + final_messages
+        # If trimming the message still exceeds the token limit, ignore the rest of the messages
+        if num_tokens_from_messages([message], model) > tokens_remaining:
+          break
 
-      break
+    # Add the message to the start of final_messages
+    final_messages.insert(0, message)
+    tokens_remaining -= raw_message_tokens
+
 
   # Add system message to the start of final_messages if it exists
   if system_message:
     final_messages = [system_message_event] + final_messages
 
   if return_response_tokens:
-    response_tokens = max_tokens - num_tokens_from_messages(
-      final_messages, model)
-    return final_messages, response_tokens
+    return final_messages, tokens_remaining
+  else:
+    return final_messages
 
-  return final_messages
