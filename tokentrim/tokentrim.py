@@ -67,6 +67,7 @@ def num_tokens_from_messages(messages: List[Dict[str, Any]],
           num_tokens += tokens_per_name
       except:
         print(f"Failed to parse '{key}'.")
+        print("messages:", messages)
         pass
 
   num_tokens += NUM_TOKENS_OFFSET
@@ -84,26 +85,26 @@ def get_trimmed_message(_message: Dict[str, Any], tokens_needed: int,
 
   # If the limit is exceeded only by the token offset of the message, return without trimming
   (_, tokens_per_message) = get_tokens_per_name_and_message(model)
-  if tokens_per_message + NUM_TOKENS_OFFSET > tokens_needed:
+  if tokens_per_message + NUM_TOKENS_OFFSET >= tokens_needed:
     return message
 
   encoding = get_encoding(model)
 
-  while True:
-    content = message["content"]
+  try:
+    while True:
+      total_tokens = num_tokens_from_messages([message], model)
+      if total_tokens <= tokens_needed:
+        break
 
-    total_tokens = num_tokens_from_messages([message], model)
-    if total_tokens <= tokens_needed:
-      break
+      tokens = encoding.encode(message["content"])
+      new_length = len(tokens) * (tokens_needed) / total_tokens - 1
 
-    tokens = encoding.encode(content)
-    new_length = len(tokens) * (tokens_needed) // total_tokens
+      half_length = int(new_length / 2)
+      (left_half, right_half) = (tokens[:half_length], tokens[-half_length:])
 
-    half_length = new_length // 2
-    (left_half, right_half) = (tokens[:half_length], tokens[-half_length:])
-    trimmed_content = encoding.decode(left_half) + '...' + encoding.decode(right_half)
-
-    message["content"] = trimmed_content
+      message["content"] = encoding.decode(left_half) + '...' + encoding.decode(right_half)
+  except:
+    print("(get_trimmed_message) message:", message, 'tokens_needed:', tokens_needed)
 
   return message
 
